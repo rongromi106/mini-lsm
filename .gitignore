@@ -1,0 +1,51 @@
+# macOS
+.DS_Store
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.o
+*.a
+*.cgo1.go
+*.cgo2.c
+*_testmain.go
+*.prof
+
+# Coverage
+*.coverprofile
+cover.out
+
+# Build directories
+bin/
+build/
+dist/
+_obj/
+_test/
+
+# Logs and temp
+*.log
+tmp/
+.cache/
+
+# Dependency/vendor
+vendor/
+
+# Environment files
+.env
+.env.*
+
+# Runtime data (generated during runs)
+data_everysec/
+
+
