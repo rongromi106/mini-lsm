@@ -188,3 +188,41 @@ func (m *memTable) NumEntries() int64 {
 	m.mu.RUnlock()
 	return n
 }
+
+func (m *memTable) Freeze() (ImmutableMemTable, error) {
+	return newImmutableMemTable(m), nil
+}
+
+// --- Immutable memTable operations ---
+// freeze swap approach to avoid deep copy and stop the world
+func newImmutableMemTable(mutableMemTable *memTable) *immutableMemTable {
+	mutableMemTable.mu.Lock()
+	defer mutableMemTable.mu.Unlock()
+	immutableMemTable := &immutableMemTable{list: mutableMemTable.list}
+	immutableMemTable.approxSize = mutableMemTable.approxSize
+	immutableMemTable.numEntries = mutableMemTable.numEntries
+	mutableMemTable.list = skiplist.New(skiplist.GreaterThanFunc(compareInternal))
+	mutableMemTable.approxSize = 0
+	mutableMemTable.numEntries = 0
+	return immutableMemTable
+}
+
+func (m *immutableMemTable) ApproxSize() int64 {
+	return m.approxSize
+}
+
+func (m *immutableMemTable) NumEntries() int64 {
+	return m.numEntries
+}
+
+func (m *immutableMemTable) Get(userKey []byte, seqLimit uint64) (val []byte, ok bool, err error) {
+	return nil, false, nil
+}
+
+func (m *immutableMemTable) NewIterator(seqLimit uint64, prefix []byte) Iterator {
+	return nil
+}
+
+func (m *immutableMemTable) NewInternalIterator() InternalIterator {
+	return nil
+}

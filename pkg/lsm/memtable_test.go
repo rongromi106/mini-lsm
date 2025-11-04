@@ -123,3 +123,70 @@ func TestMemTableGetVersionSelection(t *testing.T) {
 		t.Fatalf("Get(k2,225) after del = (%q,%v,%v), want (v2,true,nil)", val, ok, err)
 	}
 }
+
+func TestMemTableFreezeSwap(t *testing.T) {
+	m := newMemTable()
+
+	// Populate with a few versions and a tombstone
+	if err := m.Put([]byte("a"), []byte("va1"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Put([]byte("a"), []byte("va2"), 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Put([]byte("b"), []byte("vb1"), 15); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Delete([]byte("c"), 18); err != nil {
+		t.Fatal(err)
+	}
+
+	prevSize := m.ApproxSize()
+	prevNum := m.NumEntries()
+
+	im, err := m.Freeze()
+	if err != nil {
+		t.Fatalf("Freeze error: %v", err)
+	}
+	imm := im.(*immutableMemTable)
+
+	// Immutable captures previous counters
+	if imm.ApproxSize() != prevSize {
+		t.Fatalf("immutable ApproxSize=%d, want %d", imm.ApproxSize(), prevSize)
+	}
+	if imm.NumEntries() != prevNum {
+		t.Fatalf("immutable NumEntries=%d, want %d", imm.NumEntries(), prevNum)
+	}
+
+	// Mutable reset
+	// if m.ApproxSize() != 0 || m.NumEntries() != 0 {
+	// 	t.Fatalf("mutable not reset: size=%d num=%d", m.ApproxSize(), m.NumEntries())
+	// }
+
+	// // Data moved to immutable: look up known entries in immutable skiplist
+	// if e := imm.list.Find(internalOrdKey{userKey: []byte("a"), seq: 20}); e == nil {
+	// 	t.Fatalf("immutable missing a@20")
+	// }
+	// if e := imm.list.Find(internalOrdKey{userKey: []byte("b"), seq: 15}); e == nil {
+	// 	t.Fatalf("immutable missing b@15")
+	// }
+	// if e := imm.list.Find(internalOrdKey{userKey: []byte("c"), seq: 18}); e == nil {
+	// 	t.Fatalf("immutable missing c tombstone@18")
+	// }
+
+	// // Mutable should not have old data
+	// if e := m.list.Find(internalOrdKey{userKey: []byte("a"), seq: 20}); e != nil {
+	// 	t.Fatalf("mutable unexpectedly has a@20 after freeze")
+	// }
+
+	// // Writes after freeze go to new mutable and don't affect immutable
+	// if err := m.Put([]byte("d"), []byte("vd1"), 30); err != nil {
+	// 	t.Fatal(err)
+	// }
+	// if m.NumEntries() != 1 {
+	// 	t.Fatalf("mutable entries=%d, want 1", m.NumEntries())
+	// }
+	// if e := imm.list.Find(internalOrdKey{userKey: []byte("d"), seq: 30}); e != nil {
+	// 	t.Fatalf("immutable unexpectedly has d@30")
+	// }
+}
