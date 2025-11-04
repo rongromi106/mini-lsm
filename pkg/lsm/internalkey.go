@@ -10,3 +10,5 @@ type InternalKey struct {
 	Seq     uint64
 	Kind    uint8 // 1: put, 2: del
 }
+
+// type Comparator

@@ -48,4 +48,4 @@ vendor/
 # Runtime data (generated during runs)
 data_everysec/
 
-
+.gocache/

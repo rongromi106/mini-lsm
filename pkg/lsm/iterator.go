@@ -7,7 +7,7 @@ import (
 
 // Iterator is a simple iterator over the in-memory view (for now).
 type Iterator interface {
-	Seek(key []byte)
+	Seek(key []byte) // 定位到 >= userKey 的第一条可见记录
 	First()
 	Next()
 	Valid() bool
