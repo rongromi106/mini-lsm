@@ -37,7 +37,24 @@ func TestBasicPutGetDelete(t *testing.T) {
 }
 
 func BenchmarkPut(b *testing.B) {
-	b.Skip("enable after WAL/MemTable ready") // scaffolding
+	dir := b.TempDir()
+	db, err := Open(Options{Dir: dir, WALRollSize: 1 << 30, FsyncPolicy: "none"})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	val := []byte("value-xxxxxxxx")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := []byte(fmt.Sprintf("key-%08d", i))
+		if err := db.Put(ctx, key, val, &WriteOptions{Sync: false}); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func TestReplay_CleanSingleFile(t *testing.T) {

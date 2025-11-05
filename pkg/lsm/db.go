@@ -38,8 +38,9 @@ type dbImpl struct {
 	closed bool
 
 	// Placeholders for future WAL/SSTables/etc, Project 2 and 3
-	opts Options
-	wal  *Wal
+	opts     Options
+	wal      *Wal
+	memTable *memTable
 }
 
 /*
@@ -56,8 +57,9 @@ func Open(opts Options) (DB, error) {
 	}
 	os.MkdirAll(opts.Dir, 0o755)
 	db := &dbImpl{
-		kv:   make(map[string]valueVer),
-		opts: opts,
+		kv:       make(map[string]valueVer),
+		opts:     opts,
+		memTable: newMemTable(),
 	}
 
 	entries, err := os.ReadDir(opts.Dir)
@@ -85,8 +87,10 @@ func Open(opts Options) (DB, error) {
 		switch rec.Op {
 		case KindPut:
 			db.kv[string(rec.Key)] = valueVer{seq: rec.Seq, kind: KindPut, val: append([]byte(nil), rec.Value...)}
+			db.memTable.Put(rec.Key, rec.Value, rec.Seq)
 		case KindDel:
 			db.kv[string(rec.Key)] = valueVer{seq: rec.Seq, kind: KindDel}
+			db.memTable.Delete(rec.Key, rec.Seq)
 		}
 		if rec.Seq > maxSeq {
 			maxSeq = rec.Seq
@@ -152,6 +156,17 @@ func (db *dbImpl) Put(ctx context.Context, key, value []byte, wo *WriteOptions) 
 		}
 	}
 	db.kv[string(key)] = valueVer{seq: seq, kind: KindPut, val: append([]byte(nil), value...)}
+	if err := db.memTable.Put(key, value, seq); err != nil {
+		return err
+	}
+	if db.opts.MemTableSize > 0 && db.memTable.ApproxSize() > int64(db.opts.MemTableSize) {
+		// TODO: freeze + flush
+		_, err := db.memTable.Freeze()
+		if err != nil {
+			return err
+		}
+		db.memTable = newMemTable()
+	}
 	return nil
 }
 
@@ -170,6 +185,9 @@ func (db *dbImpl) Delete(ctx context.Context, key []byte, wo *WriteOptions) erro
 		}
 	}
 	db.kv[string(key)] = valueVer{seq: seq, kind: KindDel}
+	if err := db.memTable.Delete(key, seq); err != nil {
+		return err
+	}
 	return nil
 }
 
