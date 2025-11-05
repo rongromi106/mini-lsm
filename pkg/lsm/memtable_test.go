@@ -159,34 +159,107 @@ func TestMemTableFreezeSwap(t *testing.T) {
 	}
 
 	// Mutable reset
-	// if m.ApproxSize() != 0 || m.NumEntries() != 0 {
-	// 	t.Fatalf("mutable not reset: size=%d num=%d", m.ApproxSize(), m.NumEntries())
-	// }
+	if m.ApproxSize() != 0 || m.NumEntries() != 0 {
+		t.Fatalf("mutable not reset: size=%d num=%d", m.ApproxSize(), m.NumEntries())
+	}
 
-	// // Data moved to immutable: look up known entries in immutable skiplist
-	// if e := imm.list.Find(internalOrdKey{userKey: []byte("a"), seq: 20}); e == nil {
-	// 	t.Fatalf("immutable missing a@20")
-	// }
-	// if e := imm.list.Find(internalOrdKey{userKey: []byte("b"), seq: 15}); e == nil {
-	// 	t.Fatalf("immutable missing b@15")
-	// }
-	// if e := imm.list.Find(internalOrdKey{userKey: []byte("c"), seq: 18}); e == nil {
-	// 	t.Fatalf("immutable missing c tombstone@18")
-	// }
+	// Data moved to immutable: look up known entries in immutable skiplist
+	if e := imm.list.Find(internalOrdKey{userKey: []byte("a"), seq: 20}); e == nil {
+		t.Fatalf("immutable missing a@20")
+	}
+	if e := imm.list.Find(internalOrdKey{userKey: []byte("b"), seq: 15}); e == nil {
+		t.Fatalf("immutable missing b@15")
+	}
+	if e := imm.list.Find(internalOrdKey{userKey: []byte("c"), seq: 18}); e == nil {
+		t.Fatalf("immutable missing c tombstone@18")
+	}
 
-	// // Mutable should not have old data
-	// if e := m.list.Find(internalOrdKey{userKey: []byte("a"), seq: 20}); e != nil {
-	// 	t.Fatalf("mutable unexpectedly has a@20 after freeze")
-	// }
+	// Mutable should not have old data
+	if e := m.list.Find(internalOrdKey{userKey: []byte("a"), seq: 20}); e != nil {
+		t.Fatalf("mutable unexpectedly has a@20 after freeze")
+	}
 
-	// // Writes after freeze go to new mutable and don't affect immutable
-	// if err := m.Put([]byte("d"), []byte("vd1"), 30); err != nil {
-	// 	t.Fatal(err)
-	// }
-	// if m.NumEntries() != 1 {
-	// 	t.Fatalf("mutable entries=%d, want 1", m.NumEntries())
-	// }
-	// if e := imm.list.Find(internalOrdKey{userKey: []byte("d"), seq: 30}); e != nil {
-	// 	t.Fatalf("immutable unexpectedly has d@30")
-	// }
+	// Writes after freeze go to new mutable and don't affect immutable
+	if err := m.Put([]byte("d"), []byte("vd1"), 30); err != nil {
+		t.Fatal(err)
+	}
+	if m.NumEntries() != 1 {
+		t.Fatalf("mutable entries=%d, want 1", m.NumEntries())
+	}
+	if e := imm.list.Find(internalOrdKey{userKey: []byte("d"), seq: 30}); e != nil {
+		t.Fatalf("immutable unexpectedly has d@30")
+	}
+}
+
+func TestInternalIteratorOrderAndSeek(t *testing.T) {
+	m := newMemTable()
+	// a: two versions
+	if err := m.Put([]byte("a"), []byte("va1"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Put([]byte("a"), []byte("va2"), 2); err != nil {
+		t.Fatal(err)
+	}
+	// b: one put, then tombstone
+	if err := m.Put([]byte("b"), []byte("vb1"), 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Delete([]byte("b"), 4); err != nil {
+		t.Fatal(err)
+	}
+
+	im, err := m.Freeze()
+	if err != nil {
+		t.Fatalf("Freeze error: %v", err)
+	}
+	i := im.NewInternalIterator()
+
+	// First -> a@2
+	i.First()
+	if !i.Valid() {
+		t.Fatalf("iterator not valid at First")
+	}
+	ik := i.InternalKey()
+	if string(ik.UserKey) != "a" || ik.Seq != 2 || ik.Kind != KindPut {
+		t.Fatalf("First IK = (%s,%d,%d), want (a,2,KindPut)", string(ik.UserKey), ik.Seq, ik.Kind)
+	}
+	if !bytes.Equal(i.Value(), []byte("va2")) {
+		t.Fatalf("First Value = %q, want %q", i.Value(), []byte("va2"))
+	}
+
+	// Next -> a@1
+	i.Next()
+	if !i.Valid() {
+		t.Fatalf("iterator not valid at a@1")
+	}
+	ik = i.InternalKey()
+	if string(ik.UserKey) != "a" || ik.Seq != 1 || ik.Kind != KindPut {
+		t.Fatalf("Next IK = (%s,%d,%d), want (a,1,KindPut)", string(ik.UserKey), ik.Seq, ik.Kind)
+	}
+
+	// Next -> b@4 (DEL)
+	i.Next()
+	if !i.Valid() {
+		t.Fatalf("iterator not valid at b@4")
+	}
+	ik = i.InternalKey()
+	if string(ik.UserKey) != "b" || ik.Seq != 4 || ik.Kind != KindDel {
+		t.Fatalf("Next IK = (%s,%d,%d), want (b,4,KindDel)", string(ik.UserKey), ik.Seq, ik.Kind)
+	}
+
+	// SeekInternal to b@3
+	i.SeekInternal(InternalKey{UserKey: []byte("b"), Seq: 3})
+	if !i.Valid() {
+		t.Fatalf("iterator not valid at Seek b@3")
+	}
+	ik = i.InternalKey()
+	if string(ik.UserKey) != "b" || ik.Seq != 3 || ik.Kind != KindPut {
+		t.Fatalf("Seek IK = (%s,%d,%d), want (b,3,KindPut)", string(ik.UserKey), ik.Seq, ik.Kind)
+	}
+
+	// Next -> nil
+	i.Next()
+	if i.Valid() {
+		t.Fatalf("iterator should be invalid after last element")
+	}
 }

@@ -215,14 +215,126 @@ func (m *immutableMemTable) NumEntries() int64 {
 	return m.numEntries
 }
 
+// No Locking, because it is read-only, list is stable for immutableMemTable
 func (m *immutableMemTable) Get(userKey []byte, seqLimit uint64) (val []byte, ok bool, err error) {
-	return nil, false, nil
+	if m.list == nil {
+		return nil, false, nil
+	}
+	res := m.list.Find(internalOrdKey{userKey: userKey, seq: seqLimit})
+	if res == nil {
+		return nil, false, nil
+	}
+	k := res.Key().(internalOrdKey)
+	if !bytes.Equal(k.userKey, userKey) {
+		return nil, false, nil
+	}
+
+	val = res.Value.(entryVal).value
+
+	// Handling tombstone
+	if res.Value.(entryVal).kind == KindDel {
+		return nil, false, nil
+	}
+	return val, true, nil
 }
 
+/*
+This is for Range query
+Purpose: Produce a user-visible snapshot over the immutable table.
+What it yields: At most one KV per userKey — the newest Put whose seq ≤ seqLimit. Keys with only tombstones visible at seqLimit are skipped.
+Order: userKey ascending.
+Prefix: If prefix is provided, only return keys starting with prefix; stop when the next key loses the prefix.
+
+Example Usage
+it := db.NewIterator(snapshotSeq)
+it.Seek([]byte("apple"))
+*/
 func (m *immutableMemTable) NewIterator(seqLimit uint64, prefix []byte) Iterator {
-	return nil
+	vals := make(map[string][]byte)
+	if m == nil || m.list == nil {
+		return newMemIter(vals)
+	}
+	var e *skiplist.Element
+	if len(prefix) > 0 {
+		// bitwise Not 0, find the newest version of the key
+		e = m.list.Find(internalOrdKey{userKey: prefix, seq: ^uint64(0)})
+	} else {
+		e = m.list.Front()
+	}
+	// need to handle two scenarios here: (1) k is no longer the preifx (2) k's seq is greater than seqLimit
+	for e != nil {
+		k := e.Key().(internalOrdKey)
+		if len(prefix) > 0 && !bytes.HasPrefix(k.userKey, prefix) {
+			break
+		}
+		// scan through all user key with the same prefix to find the first visible value
+		userKey := k.userKey
+		for cur := e; cur != nil; cur = cur.Next() {
+			if !bytes.Equal(cur.Key().(internalOrdKey).userKey, userKey) {
+				break
+			}
+			if cur.Key().(internalOrdKey).seq > seqLimit {
+				break
+			}
+			val := cur.Value.(entryVal)
+			if val.kind == KindDel {
+				continue
+			}
+			if val.kind == KindPut {
+				vals[string(userKey)] = val.value
+				break
+			}
+		}
+		// Advance e to next distinct userKey
+		for e = e.Next(); e != nil; e = e.Next() {
+			nk := e.Key().(internalOrdKey)
+			if !bytes.Equal(nk.userKey, k.userKey) {
+				break
+			}
+		}
+	}
+
+	return newMemIter(vals)
 }
 
 func (m *immutableMemTable) NewInternalIterator() InternalIterator {
+	return &internalIter{list: m.list}
+}
+
+// internalIter iterates immutable memtable in InternalKey order (userKey asc, seq desc).
+type internalIter struct {
+	list *skiplist.SkipList
+	elem *skiplist.Element
+}
+
+func (it *internalIter) First() {
+	it.elem = it.list.Front()
+}
+
+func (it *internalIter) SeekInternal(ikey InternalKey) {
+	it.elem = it.list.Find(internalOrdKey{userKey: ikey.UserKey, seq: ikey.Seq})
+}
+
+func (it *internalIter) Next() {
+	// TODO: advance it.elem to the next element
+	it.elem = it.elem.Next()
+}
+
+func (it *internalIter) Valid() bool {
+	return it.elem != nil
+}
+
+func (it *internalIter) InternalKey() InternalKey {
+	return InternalKey{UserKey: it.elem.Key().(internalOrdKey).userKey,
+		Seq:  it.elem.Key().(internalOrdKey).seq,
+		Kind: it.elem.Value.(entryVal).kind}
+}
+
+func (it *internalIter) Value() []byte {
+	return it.elem.Value.(entryVal).value
+}
+
+func (it *internalIter) Close() error {
+	// TODO: release any resources if needed (usually no-op)
 	return nil
 }
