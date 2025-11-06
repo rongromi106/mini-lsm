@@ -278,7 +278,8 @@ func (tw *tableWriter) Add(ikey InternalKey, value []byte) error {
 	return nil
 }
 
-// TODO: implement this
+// Flush partial block, write to filter, index and write footer
+// Calls Fsync for file write then done
 func (tw *tableWriter) Finish() (Footer, error) {
 	// flush last partial block
 	if tw.curBlockApprox > 0 {
@@ -287,10 +288,67 @@ func (tw *tableWriter) Finish() (Footer, error) {
 		}
 	}
 
-	return Footer{}, nil
+	var indexH, filterH BlockHandle
+	// 2) Write index block.
+	if tw.index != nil {
+		idx := tw.index.Finish()
+		if len(idx) > 0 {
+			out, err := tw.compressor.Compress(idx)
+			if err != nil {
+				return Footer{}, err
+			}
+			if err := writeAtAll(tw.f, int64(tw.offset), out); err != nil {
+				return Footer{}, err
+			}
+			indexH = BlockHandle{Offset: tw.offset, Length: uint64(len(out))}
+			tw.offset += uint64(len(out))
+		}
+	}
+
+	// 3) Write filter block.
+	if tw.filter != nil {
+		filter := tw.filter.Finish()
+		if len(filter) > 0 {
+			out, err := tw.compressor.Compress(filter)
+			if err != nil {
+				return Footer{}, err
+			}
+			if err := writeAtAll(tw.f, int64(tw.offset), out); err != nil {
+				return Footer{}, err
+			}
+			filterH = BlockHandle{Offset: tw.offset, Length: uint64(len(out))}
+			tw.offset += uint64(len(out))
+		}
+	}
+
+	footer := Footer{
+		IndexHandle:  indexH,
+		FilterHandle: filterH,
+		Version:      sstVersion,
+		Magic:        sstMagic,
+	}
+
+	// 4) Write footer
+	fb := encodeFooter(footer)
+	if err := writeAtAll(tw.f, int64(tw.offset), fb); err != nil {
+		return Footer{}, err
+	}
+	tw.offset += uint64(len(fb))
+
+	// 5) Fsync
+	if err := tw.f.Sync(); err != nil {
+		return Footer{}, err
+	}
+	return footer, nil
 }
 
-func (tw *tableWriter) Close() error { return nil }
+// Handles file close
+func (tw *tableWriter) Close() error {
+	if err := tw.f.Close(); err != nil {
+		return err
+	}
+	return nil
+}
 
 // flushCurrentBlock finalizes and writes the current data block
 func (tw *tableWriter) flushCurrentBlock() error {
