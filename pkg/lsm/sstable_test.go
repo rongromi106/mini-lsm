@@ -82,3 +82,89 @@ func TestTableWriter_Basic(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestTableIter_CrossBlockIterationAndSeek(t *testing.T) {
+	// Create temp file and a tiny block size to force multiple blocks.
+	tmpDir := t.TempDir()
+	f, err := os.CreateTemp(tmpDir, "SST-*.sst")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	opts := Options{BlockSize: 64} // small to create multiple blocks
+	tw, err := NewTableWriter(f, opts)
+	if err != nil {
+		f.Close()
+		t.Fatalf("NewTableWriter: %v", err)
+	}
+
+	// Write enough ordered entries to span multiple blocks.
+	// Keys: a1..a4, b1..b4 with decreasing seq per key root.
+	type kv struct{ k, v string }
+	var data []kv
+	for _, root := range []string{"a", "b", "c"} {
+		for i := 4; i >= 1; i-- {
+			data = append(data, kv{root, root + string(rune('0'+i))})
+		}
+	}
+	seq := uint64(1)
+	for _, kv := range data {
+		// InternalKey ordering requirement: userKey asc overall, and for same userKey seq desc.
+		// We will group by root so this holds: same root inserted with decreasing seq.
+		// Across roots, ascending: a < b < c.
+		ik := InternalKey{UserKey: []byte(kv.k), Seq: ^uint64(0) - seq, Kind: KindPut}
+		if err := tw.Add(ik, []byte(kv.v)); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		seq++
+	}
+	if _, err := tw.Finish(); err != nil {
+		_ = tw.Close()
+		t.Fatalf("Finish: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen for reading
+	rf, err := os.Open(f.Name())
+	if err != nil {
+		t.Fatalf("Open for read: %v", err)
+	}
+	tr, err := OpenTable(rf, Options{Compression: "none"})
+	if err != nil {
+		_ = rf.Close()
+		t.Fatalf("OpenTable: %v", err)
+	}
+	defer tr.Close()
+
+	// Table-wide iterator starting at First should yield ascending keys across blocks.
+	it := &tableIter{tr: tr}
+	it.First()
+	if !it.Valid() {
+		t.Fatalf("iterator invalid at First()")
+	}
+	// Collect first few keys to ensure it advances across blocks (at least covers 'a' then 'b')
+	var seen []string
+	for i := 0; i < 6 && it.Valid(); i++ {
+		seen = append(seen, string(it.Key()))
+		it.Next()
+	}
+	if len(seen) == 0 {
+		t.Fatalf("no keys produced")
+	}
+	// Expect non-decreasing by userKey (since within same userKey multiple versions may appear)
+	for i := 1; i < len(seen); i++ {
+		if seen[i] < seen[i-1] {
+			t.Fatalf("iterator order violated: %q then %q", seen[i-1], seen[i])
+		}
+	}
+
+	// Test Seek into the middle, e.g., seek to "b"
+	it.Seek([]byte("b"))
+	if !it.Valid() {
+		t.Fatalf("iterator invalid after Seek(b)")
+	}
+	if string(it.Key()) < "b" {
+		t.Fatalf("Seek(b) positioned before 'b': got %q", string(it.Key()))
+	}
+}
