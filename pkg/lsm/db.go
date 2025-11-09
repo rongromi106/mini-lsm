@@ -3,6 +3,7 @@ package lsm
 import (
 	"context"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // DB is the user-facing interface.
@@ -38,9 +40,12 @@ type dbImpl struct {
 	closed bool
 
 	// Placeholders for future WAL/SSTables/etc, Project 2 and 3
-	opts     Options
-	wal      *Wal
-	memTable *memTable
+	opts Options
+	wal  *Wal
+	// current actvie memtable
+	memTable    *memTable
+	flusheQueue []ImmutableMemTable
+	stopChan    chan struct{}
 }
 
 /*
@@ -57,9 +62,11 @@ func Open(opts Options) (DB, error) {
 	}
 	os.MkdirAll(opts.Dir, 0o755)
 	db := &dbImpl{
-		kv:       make(map[string]valueVer),
-		opts:     opts,
-		memTable: newMemTable(),
+		kv:          make(map[string]valueVer),
+		opts:        opts,
+		memTable:    newMemTable(),
+		flusheQueue: make([]ImmutableMemTable, 0),
+		stopChan:    make(chan struct{}),
 	}
 
 	entries, err := os.ReadDir(opts.Dir)
@@ -123,6 +130,8 @@ func Open(opts Options) (DB, error) {
 		return nil, err
 	}
 	db.wal = w
+	// is it ok to be like this? using one single go routine to flush.
+	go db.flush()
 	return db, nil
 }
 
@@ -160,12 +169,13 @@ func (db *dbImpl) Put(ctx context.Context, key, value []byte, wo *WriteOptions) 
 		return err
 	}
 	if db.opts.MemTableSize > 0 && db.memTable.ApproxSize() > int64(db.opts.MemTableSize) {
-		// TODO: freeze + flush
-		_, err := db.memTable.Freeze()
+		immutableMemTable, err := db.memTable.Freeze()
 		if err != nil {
 			return err
 		}
 		db.memTable = newMemTable()
+		// Flushing work is done in a background goroutine
+		db.flusheQueue = append(db.flusheQueue, immutableMemTable)
 	}
 	return nil
 }
@@ -219,5 +229,63 @@ func (db *dbImpl) Close() error {
 		}
 	}
 	db.closed = true
+	return nil
+}
+
+// Flushing immutable memtable to sstable
+func (db *dbImpl) flush() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			// Drain the queue safely: pop one at a time under lock, flush outside the lock.
+			for {
+				db.mu.Lock()
+				if len(db.flusheQueue) == 0 {
+					db.mu.Unlock()
+					break
+				}
+				imm := db.flusheQueue[0]
+				db.flusheQueue = db.flusheQueue[1:]
+				db.mu.Unlock()
+
+				if err := db.flushImmutableMemTable(imm); err != nil {
+					log.Println("flush immutable memtable failed", err)
+					// continue draining subsequent items; optionally add backoff/retry later
+				}
+			}
+		case <-db.stopChan:
+			return
+		}
+	}
+}
+
+func (db *dbImpl) flushImmutableMemTable(imm ImmutableMemTable) error {
+	// Create a temporary SSTable file in the DB directory
+	tmpFile, err := os.CreateTemp(db.opts.Dir, "SST-*.sst.tmp")
+	if err != nil {
+		return err
+	}
+	// The table writer owns only the writing, caller manages renames
+	tw, err := NewTableWriter(tmpFile, db.opts)
+	if err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	defer tw.Close()
+
+	// Iterate immutable memtable in InternalKey order and write entries
+	it := imm.NewInternalIterator()
+	defer it.Close()
+	it.First()
+	for it.Valid() {
+		tw.Add(it.InternalKey(), it.Value())
+		it.Next()
+	}
+	if _, err := tw.Finish(); err != nil {
+		return err
+	}
+	// Caller may later rename tmpFile.Name() to a final SSTable name in MANIFEST flow
 	return nil
 }
