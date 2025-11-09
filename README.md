@@ -60,7 +60,7 @@ go test ./...
 	•	Delete(key,seq)：插入 <key, seq, DEL> tombstone。
 	•	写入先 WAL 成功后才能对 MemTable 可见（由上层保证顺序）。
 	•	写入并发：前台写串行化（或基于内部细粒度锁）。
-读不阻塞写（读路径尽量 lock-free 或短锁）。
+	- 读不阻塞写（读路径尽量 lock-free 或短锁）。
 
 4. 读取语义
 	•	Get(key, snapshot_seq)：
