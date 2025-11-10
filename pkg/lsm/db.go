@@ -3,6 +3,7 @@ package lsm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -46,6 +47,8 @@ type dbImpl struct {
 	memTable    *memTable
 	flusheQueue []ImmutableMemTable
 	stopChan    chan struct{}
+	// tracked SSTables (L0 only for now), newest appended last
+	sstReaders []*tableReader
 }
 
 /*
@@ -67,6 +70,7 @@ func Open(opts Options) (DB, error) {
 		memTable:    newMemTable(),
 		flusheQueue: make([]ImmutableMemTable, 0),
 		stopChan:    make(chan struct{}),
+		sstReaders:  make([]*tableReader, 0),
 	}
 
 	entries, err := os.ReadDir(opts.Dir)
@@ -130,10 +134,51 @@ func Open(opts Options) (DB, error) {
 		return nil, err
 	}
 	db.wal = w
+
+	// Load existing SSTables (L0) by scanning directory; newest last
+	// Left out manifest flow for now
+	entries2, err := os.ReadDir(opts.Dir)
+	if err == nil {
+		reSST := regexp.MustCompile(`^SST-(\d{6})\.sst$`)
+		type sstEnt struct {
+			id   int
+			path string
+		}
+		ssts := []sstEnt{}
+		for _, ent := range entries2 {
+			m := reSST.FindStringSubmatch(ent.Name())
+			if m == nil {
+				continue
+			}
+			id, _ := strconv.Atoi(m[1])
+			ssts = append(ssts, sstEnt{id: id, path: filepath.Join(opts.Dir, ent.Name())})
+		}
+		slices.SortFunc(ssts, func(a, b sstEnt) int {
+			return a.id - b.id
+		})
+		for _, se := range ssts {
+			f, err := os.Open(se.path)
+			if err != nil {
+				continue
+			}
+			tr, err := OpenTable(f, opts)
+			if err != nil {
+				_ = f.Close()
+				continue
+			}
+			db.sstReaders = append(db.sstReaders, tr)
+		}
+	}
 	// is it ok to be like this? using one single go routine to flush.
 	go db.flush()
 	return db, nil
 }
+
+/*
+Point-lookup workflow
+Goal: find the newest visible version of key (seq <= snapshot_seq) and honor tombstones
+Search order (newest -> oldest)
+*/
 
 func (db *dbImpl) Get(ctx context.Context, key []byte, ro *ReadOptions) ([]byte, bool, error) {
 	db.mu.RLock()
@@ -141,12 +186,52 @@ func (db *dbImpl) Get(ctx context.Context, key []byte, ro *ReadOptions) ([]byte,
 	if db.closed {
 		return nil, false, errors.New("db is closed")
 	}
-
-	vv, ok := db.kv[string(key)]
-	if !ok || vv.kind == KindDel {
-		return nil, false, nil
+	seqLimit := ^uint64(0)
+	if ro != nil && ro.Snapshot != nil {
+		seqLimit = ro.Snapshot.Seq
 	}
-	return append([]byte(nil), vv.val...), true, nil
+
+	// 0. KV memory in db
+	if cur, ok := db.kv[string(key)]; ok {
+		if cur.kind != KindDel && cur.seq <= seqLimit {
+			return append([]byte(nil), cur.val...), true, nil
+		}
+	}
+
+	// 1. Active MemTable
+	val, ok, err := db.memTable.Get(key, seqLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	if ok {
+		return val, true, nil
+	}
+
+	// 2. Immutable MemTables
+	for _, imm := range db.flusheQueue {
+		val, ok, err := imm.Get(key, seqLimit)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			return val, true, nil
+		}
+	}
+
+	// 3. SSTables (L0 only) - search newest to oldest
+	for i := len(db.sstReaders) - 1; i >= 0; i-- {
+		tr := db.sstReaders[i]
+		val, ok, err := tr.Get(key, seqLimit)
+		if err != nil {
+			// on corruption/IO, skip to next
+			continue
+		}
+		if ok {
+			return append([]byte(nil), val...), true, nil
+		}
+	}
+
+	return nil, false, nil
 }
 
 func (db *dbImpl) Put(ctx context.Context, key, value []byte, wo *WriteOptions) error {
@@ -286,6 +371,37 @@ func (db *dbImpl) flushImmutableMemTable(imm ImmutableMemTable) error {
 	if _, err := tw.Finish(); err != nil {
 		return err
 	}
-	// Caller may later rename tmpFile.Name() to a final SSTable name in MANIFEST flow
+
+	// Rename tmp to final SST-000xxx.sst (compute next id by scanning dir)
+	nextId := 1
+	ents, _ := os.ReadDir(db.opts.Dir)
+	reSST := regexp.MustCompile(`^SST-(\d{6})\.sst$`)
+	for _, ent := range ents {
+		m := reSST.FindStringSubmatch(ent.Name())
+		if m == nil {
+			continue
+		}
+		id, _ := strconv.Atoi(m[1])
+		if id >= nextId {
+			nextId = id + 1
+		}
+	}
+	finalName := filepath.Join(db.opts.Dir, fmt.Sprintf("SST-%06d.sst", nextId))
+	if err := os.Rename(tmpFile.Name(), finalName); err != nil {
+		return err
+	}
+	// Open reader and track it
+	rf, err := os.Open(finalName)
+	if err != nil {
+		return err
+	}
+	tr, err := OpenTable(rf, db.opts)
+	if err != nil {
+		_ = rf.Close()
+		return err
+	}
+	db.mu.Lock()
+	db.sstReaders = append(db.sstReaders, tr)
+	db.mu.Unlock()
 	return nil
 }
