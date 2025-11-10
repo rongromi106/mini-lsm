@@ -40,7 +40,8 @@ go test ./...
 
 - Replace the in-memory store with:
   - WAL append on write (fsync policy). -- Done
-  - MemTable (skiplist) + Immutable flush to SSTable.
+  - MemTable (skiplist) + Immutable flush to SSTable. -- Done
+  - Updates flushing workflow to be channel based design 
 
 ### MemTable
 1. 目标与范围
@@ -99,4 +100,9 @@ go test ./...
 
   - Simple L0-only SSTable reading.
 - Add Bloom filters, block cache, and leveling compaction.
+
+### GET flow in DB
+	•	Point-lookup path (recommended): probe sources in a smart order (no full merge iterator).
+	•	General merge iterator: K-way merge across all sources (great for range scans; overkill for single-key Get).
+
 # mini-lsm
