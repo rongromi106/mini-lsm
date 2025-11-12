@@ -105,4 +105,10 @@ go test ./...
 	•	Point-lookup path (recommended): probe sources in a smart order (no full merge iterator).
 	•	General merge iterator: K-way merge across all sources (great for range scans; overkill for single-key Get).
 
+
+### Bloom Filters
+* In the MVP, the Bloom Filter is added to SSTables, not MemTables
+* This is because SSTables would avoid disk I/O, and memtable lookup is in RAM and already log N time
+* In this MVP, the Bloom Filter is a per sstable attribute, not per data block
+
 # mini-lsm

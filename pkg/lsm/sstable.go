@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+
+	bloom "github.com/bits-and-blooms/bloom/v3"
 )
 
 // --- On-disk basics ---
@@ -54,18 +56,41 @@ func (n *noCompression) Decompress(in []byte) ([]byte, error) { return in, nil }
 // FilterPolicy provides a per-table filter (e.g., Bloom) to avoid unnecessary IO.
 type FilterPolicy interface {
 	Name() string
-	MayContain(key []byte, filter []byte) bool
-	Build(keys [][]byte) []byte
+	MayContain(key []byte) bool
+	Add(key []byte)
+	WriteToBuffer() ([]byte, error)
+	ReadFromBuffer([]byte) error
 }
 
 // BloomPolicy is a stub implementation with configurable false positive rate.
-type BloomPolicy struct{ FpRate float64 }
+type BloomPolicy struct {
+	FpRate float64
+	Filter *bloom.BloomFilter
+}
 
 func (b *BloomPolicy) Name() string { return "bloom" }
 
-func (b *BloomPolicy) MayContain(_ []byte, _ []byte) bool { return true }
+func (b *BloomPolicy) MayContain(userKey []byte) bool {
+	return b.Filter.Test(userKey)
+}
 
-func (b *BloomPolicy) Build(_ [][]byte) []byte { return nil }
+func (b *BloomPolicy) Add(key []byte) {
+	b.Filter.Add(key)
+}
+
+func (b *BloomPolicy) WriteToBuffer() ([]byte, error) {
+	var buf bytes.Buffer
+	_, err := b.Filter.WriteTo(&buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (b *BloomPolicy) ReadFromBuffer(buf []byte) error {
+	_, err := b.Filter.ReadFrom(bytes.NewReader(buf))
+	return err
+}
 
 // --- Block builders/readers (skeleton) ---
 
@@ -555,27 +580,33 @@ func (ib *indexBuilder) Finish() []byte {
 	return buf
 }
 
-// filterBuilder accumulates keys per data-block for filter construction (stubbed).
 type filterBuilder struct {
 	policy FilterPolicy
-	buf    []byte
-}
-
-func (fb *filterBuilder) StartBlock(blockOffset uint64) {
-	// append block boundary marker
-	tmp := make([]byte, 8)
-	binary.LittleEndian.PutUint64(tmp, blockOffset)
-	fb.buf = append(fb.buf, tmp...)
+	// Accumulating user keys for filter construction
+	keys    [][]byte
+	lastKey []byte
 }
 
 func (fb *filterBuilder) AddKey(userKey []byte) {
-	var hdr [10]byte
-	n := binary.PutUvarint(hdr[:], uint64(len(userKey)))
-	fb.buf = append(fb.buf, hdr[:n]...)
-	fb.buf = append(fb.buf, userKey...)
+	// skip duplicates when keys are grouped by userKey
+	if len(fb.lastKey) > 0 && bytes.Equal(fb.lastKey, userKey) {
+		return
+	}
+	fb.lastKey = append(fb.lastKey[:0], userKey...)
+	fb.keys = append(fb.keys, append([]byte(nil), userKey...))
 }
 
-func (fb *filterBuilder) Finish() []byte { return fb.buf }
+func (fb *filterBuilder) Finish() []byte {
+	if fb.policy == nil {
+		return nil
+	}
+	for i := range fb.keys {
+		fb.policy.Add(fb.keys[i])
+	}
+
+	data, _ := fb.policy.WriteToBuffer()
+	return data
+}
 
 // --- Table writer (skeleton) ---
 
@@ -628,7 +659,7 @@ func (tw *tableWriter) Add(ikey InternalKey, value []byte) error {
 	// Write to current block
 	tw.dataBuilder.Add(ikey.UserKey, value)
 	tw.curBlockApprox += len(ikey.UserKey) + len(value) + 8
-	// TODO: Add Bloom Filter
+
 	if tw.filter != nil {
 		tw.filter.AddKey(ikey.UserKey)
 	}
@@ -720,10 +751,7 @@ func (tw *tableWriter) flushCurrentBlock() error {
 	if err != nil {
 		return err
 	}
-	// TODO: Add Bloom Filter
-	if tw.filter != nil {
-		tw.filter.StartBlock(tw.offset)
-	}
+
 	if err := writeAtAll(tw.f, int64(tw.offset), out); err != nil {
 		return err
 	}
@@ -758,8 +786,8 @@ func NewTableWriter(f *os.File, opts Options) (*tableWriter, error) {
 		opts:        opts,
 		cmp:         bytes.Compare,
 		blockSize:   blkSize,
-		compressor:  pickCompressor(opts.Compression),                        // No compression for now
-		filter:      &filterBuilder{policy: defaultFilter(opts.BloomFpRate)}, // Ignore. TODO: Add Bloom Filter
+		compressor:  pickCompressor(opts.Compression), // No compression for now
+		filter:      &filterBuilder{policy: defaultFilter(opts.BloomFpRate)},
 		dataBuilder: &blockBuilder{},
 		index:       &indexBuilder{},
 	}
@@ -853,22 +881,28 @@ func OpenTable(f *os.File, opts Options) (*tableReader, error) {
 		tr.indexEntries = entries
 	}
 
-	// Read filter Block -- for later
-	// if footer.FilterHandle.Length > 0 {
-	// 	buf := make([]byte, footer.FilterHandle.Length)
-	// 	_, err := f.ReadAt(buf, int64(footer.FilterHandle.Offset))
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	tr.filter = buf
-	// }
+	// Read filter Block
+	if footer.FilterHandle.Length > 0 {
+		buf := make([]byte, int(footer.FilterHandle.Length))
+		if _, err := f.ReadAt(buf, int64(footer.FilterHandle.Offset)); err != nil {
+			return nil, err
+		}
+		if err := tr.filter.ReadFromBuffer(buf); err != nil {
+			return nil, err
+		}
+	}
 
 	return tr, nil
 }
 
 // Single point lookup
 func (tr *tableReader) Get(userKey []byte, seqLimit uint64) ([]byte, bool, error) {
-	// TODO: optional Bloom check
+	// Fast negative: if filter says not present, skip IO
+	if tr.filter != nil && !tr.filter.MayContain(userKey) {
+		return nil, false, nil
+	}
+	// Could be a false positive; proceed to index/data lookup
+
 	if len(tr.indexEntries) == 0 {
 		return nil, false, nil
 	}
@@ -952,7 +986,9 @@ func (tr *tableReader) Close() error {
 
 func pickCompressor(_ string) Compressor { return &noCompression{} }
 
-func defaultFilter(fpRate float64) FilterPolicy { return &BloomPolicy{FpRate: fpRate} }
+func defaultFilter(fpRate float64) FilterPolicy {
+	return &BloomPolicy{FpRate: fpRate, Filter: bloom.NewWithEstimates(1000000, fpRate)}
+}
 
 // The last 44 bytes of the file is the footer
 const footerSize = 44
