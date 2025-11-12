@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // DB is the user-facing interface.
@@ -34,6 +33,11 @@ type valueVer struct {
 	val  []byte
 }
 
+type immItem struct {
+	id  uint64
+	tbl ImmutableMemTable
+}
+
 type dbImpl struct {
 	mu     sync.RWMutex
 	seq    atomic.Uint64
@@ -45,10 +49,65 @@ type dbImpl struct {
 	wal  *Wal
 	// current actvie memtable
 	memTable    *memTable
-	flusheQueue []ImmutableMemTable
+	flusheQueue []immItem
 	stopChan    chan struct{}
 	// tracked SSTables (L0 only for now), newest appended last
 	sstReaders []*tableReader
+	flusher    *Flusher
+	// results from background flusher
+	flushResultCh chan flushResult
+	immIndex      map[uint64]int
+	nextImmID     atomic.Uint64
+}
+
+type FlushJob struct {
+	id  uint64
+	imm ImmutableMemTable
+}
+
+type Flusher struct {
+	jobs     chan FlushJob
+	stopChan chan struct{}
+	opts     Options
+	resultCh chan flushResult
+}
+
+type flushResult struct {
+	id uint64
+	tr *tableReader
+}
+
+func NewFlusher(dbOpts Options, resultCh chan flushResult) *Flusher {
+	f := &Flusher{
+		jobs:     make(chan FlushJob, 8),
+		stopChan: make(chan struct{}),
+		opts:     dbOpts,
+		resultCh: resultCh,
+	}
+	go f.run()
+	return f
+}
+
+func (f *Flusher) run() {
+	for {
+		select {
+		case <-f.stopChan:
+			return
+		case job := <-f.jobs:
+			tr, err := f.flushImmutableMemTable(job.imm)
+			if err != nil {
+				log.Println("flush immutable memtable failed", err)
+				// continue draining subsequent items; optionally add backoff/retry later
+				continue
+			}
+			// publish result back to DB
+			f.resultCh <- flushResult{id: job.id, tr: tr}
+		}
+	}
+}
+
+func (f *Flusher) Submit(job FlushJob) {
+	f.jobs <- job
 }
 
 /*
@@ -68,9 +127,10 @@ func Open(opts Options) (DB, error) {
 		kv:          make(map[string]valueVer),
 		opts:        opts,
 		memTable:    newMemTable(),
-		flusheQueue: make([]ImmutableMemTable, 0),
+		flusheQueue: make([]immItem, 0),
 		stopChan:    make(chan struct{}),
 		sstReaders:  make([]*tableReader, 0),
+		immIndex:    make(map[uint64]int),
 	}
 
 	entries, err := os.ReadDir(opts.Dir)
@@ -169,8 +229,33 @@ func Open(opts Options) (DB, error) {
 			db.sstReaders = append(db.sstReaders, tr)
 		}
 	}
-	// is it ok to be like this? using one single go routine to flush.
-	go db.flush()
+	// setup background flusher and result listener
+	db.flushResultCh = make(chan flushResult, 8)
+	db.flusher = NewFlusher(opts, db.flushResultCh)
+	go func() {
+		for {
+			select {
+			case res := <-db.flushResultCh:
+				db.mu.Lock()
+				// remove flushed immutable from queue using id-index map (O(1))
+				// first, swap the last item and update the index map
+				if idx, ok := db.immIndex[res.id]; ok {
+					last := len(db.flusheQueue) - 1
+					db.flusheQueue[idx] = db.flusheQueue[last]
+					db.flusheQueue = db.flusheQueue[:last]
+					if idx < len(db.flusheQueue) {
+						db.immIndex[db.flusheQueue[idx].id] = idx
+					}
+					delete(db.immIndex, res.id)
+				}
+				// append new table reader
+				db.sstReaders = append(db.sstReaders, res.tr)
+				db.mu.Unlock()
+			case <-db.stopChan:
+				return
+			}
+		}
+	}()
 	return db, nil
 }
 
@@ -208,8 +293,8 @@ func (db *dbImpl) Get(ctx context.Context, key []byte, ro *ReadOptions) ([]byte,
 	}
 
 	// 2. Immutable MemTables
-	for _, imm := range db.flusheQueue {
-		val, ok, err := imm.Get(key, seqLimit)
+	for _, item := range db.flusheQueue {
+		val, ok, err := item.tbl.Get(key, seqLimit)
 		if err != nil {
 			return nil, false, err
 		}
@@ -259,8 +344,11 @@ func (db *dbImpl) Put(ctx context.Context, key, value []byte, wo *WriteOptions) 
 			return err
 		}
 		db.memTable = newMemTable()
-		// Flushing work is done in a background goroutine
-		db.flusheQueue = append(db.flusheQueue, immutableMemTable)
+		// Track immutable memtable and submit background flush job
+		id := db.nextImmID.Add(1)
+		db.flusheQueue = append(db.flusheQueue, immItem{id: id, tbl: immutableMemTable})
+		db.immIndex[id] = len(db.flusheQueue) - 1
+		go db.flusher.Submit(FlushJob{id: id, imm: immutableMemTable})
 	}
 	return nil
 }
@@ -318,45 +406,19 @@ func (db *dbImpl) Close() error {
 }
 
 // Flushing immutable memtable to sstable
-func (db *dbImpl) flush() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			// Drain the queue safely: pop one at a time under lock, flush outside the lock.
-			for {
-				db.mu.Lock()
-				if len(db.flusheQueue) == 0 {
-					db.mu.Unlock()
-					break
-				}
-				imm := db.flusheQueue[0]
-				db.flusheQueue = db.flusheQueue[1:]
-				db.mu.Unlock()
+// legacy flush loop removed in favor of Flusher + channels
 
-				if err := db.flushImmutableMemTable(imm); err != nil {
-					log.Println("flush immutable memtable failed", err)
-					// continue draining subsequent items; optionally add backoff/retry later
-				}
-			}
-		case <-db.stopChan:
-			return
-		}
-	}
-}
-
-func (db *dbImpl) flushImmutableMemTable(imm ImmutableMemTable) error {
+func (f *Flusher) flushImmutableMemTable(imm ImmutableMemTable) (*tableReader, error) {
 	// Create a temporary SSTable file in the DB directory
-	tmpFile, err := os.CreateTemp(db.opts.Dir, "SST-*.sst.tmp")
+	tmpFile, err := os.CreateTemp(f.opts.Dir, "SST-*.sst.tmp")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// The table writer owns only the writing, caller manages renames
-	tw, err := NewTableWriter(tmpFile, db.opts)
+	tw, err := NewTableWriter(tmpFile, f.opts)
 	if err != nil {
 		_ = tmpFile.Close()
-		return err
+		return nil, err
 	}
 	defer tw.Close()
 
@@ -369,12 +431,12 @@ func (db *dbImpl) flushImmutableMemTable(imm ImmutableMemTable) error {
 		it.Next()
 	}
 	if _, err := tw.Finish(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Rename tmp to final SST-000xxx.sst (compute next id by scanning dir)
 	nextId := 1
-	ents, _ := os.ReadDir(db.opts.Dir)
+	ents, _ := os.ReadDir(f.opts.Dir)
 	reSST := regexp.MustCompile(`^SST-(\d{6})\.sst$`)
 	for _, ent := range ents {
 		m := reSST.FindStringSubmatch(ent.Name())
@@ -386,22 +448,19 @@ func (db *dbImpl) flushImmutableMemTable(imm ImmutableMemTable) error {
 			nextId = id + 1
 		}
 	}
-	finalName := filepath.Join(db.opts.Dir, fmt.Sprintf("SST-%06d.sst", nextId))
+	finalName := filepath.Join(f.opts.Dir, fmt.Sprintf("SST-%06d.sst", nextId))
 	if err := os.Rename(tmpFile.Name(), finalName); err != nil {
-		return err
+		return nil, err
 	}
 	// Open reader and track it
 	rf, err := os.Open(finalName)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	tr, err := OpenTable(rf, db.opts)
+	tr, err := OpenTable(rf, f.opts)
 	if err != nil {
 		_ = rf.Close()
-		return err
+		return nil, err
 	}
-	db.mu.Lock()
-	db.sstReaders = append(db.sstReaders, tr)
-	db.mu.Unlock()
-	return nil
+	return tr, nil
 }
